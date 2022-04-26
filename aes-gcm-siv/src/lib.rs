@@ -132,10 +132,10 @@ pub use aead;
 use aead::{AeadCore, AeadInPlace, Error, NewAead};
 use cipher::{
     consts::{U0, U12, U16},
-    generic_array::{typenum::Unsigned, ArrayLength, GenericArray},
-    Block, BlockCipher, BlockEncrypt, FromBlockCipher, NewBlockCipher, StreamCipher,
+    generic_array::{typenum::Unsigned, GenericArray},
+    BlockCipher, BlockEncrypt, InnerIvInit, KeyInit, KeyIvInit, ParBlocksSizeUser, StreamCipher,
 };
-use ctr::Ctr32LE;
+use ctr::{flavors::Ctr32LE as FlavorCtr32LE, Ctr32LE, CtrCore};
 use polyval::{
     universal_hash::{NewUniversalHash, UniversalHash},
     Polyval,
@@ -176,8 +176,7 @@ pub type Aes256GcmSiv = AesGcmSiv<Aes256>;
 #[derive(Clone)]
 pub struct AesGcmSiv<Aes>
 where
-    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     /// Key generating key used to derive AES-GCM-SIV subkeys
     key_generating_key: Aes,
@@ -185,8 +184,7 @@ where
 
 impl<Aes> NewAead for AesGcmSiv<Aes>
 where
-    Aes: NewBlockCipher + BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     type KeySize = Aes::KeySize;
 
@@ -199,8 +197,7 @@ where
 
 impl<Aes> From<Aes> for AesGcmSiv<Aes>
 where
-    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     fn from(key_generating_key: Aes) -> Self {
         Self { key_generating_key }
@@ -209,8 +206,7 @@ where
 
 impl<Aes> AeadCore for AesGcmSiv<Aes>
 where
-    Aes: NewBlockCipher + BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     type NonceSize = U12;
     type TagSize = U16;
@@ -219,8 +215,7 @@ where
 
 impl<Aes> AeadInPlace for AesGcmSiv<Aes>
 where
-    Aes: NewBlockCipher + BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     fn encrypt_in_place_detached(
         &self,
@@ -250,8 +245,7 @@ where
 /// AES-GCM-SIV: Misuse-Resistant Authenticated Encryption Cipher (RFC 8452)
 struct Cipher<Aes>
 where
-    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     /// Encryption cipher
     enc_cipher: Aes,
@@ -265,8 +259,7 @@ where
 
 impl<Aes> Cipher<Aes>
 where
-    Aes: NewBlockCipher + BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     /// Initialize AES-GCM-SIV, deriving per-nonce message-authentication and
     /// message-encryption keys.
@@ -349,7 +342,8 @@ where
         self.polyval.update_padded(associated_data);
         let mut ctr = init_ctr(&self.enc_cipher, tag);
 
-        for chunk in buffer.chunks_mut(Aes::BlockSize::to_usize() * Aes::ParBlocks::to_usize()) {
+        for chunk in buffer.chunks_mut(Aes::BlockSize::to_usize() * Aes::ParBlocksSize::to_usize())
+        {
             ctr.apply_keystream(chunk);
             self.polyval.update_padded(chunk);
         }
@@ -406,12 +400,12 @@ where
 ///
 /// > The initial counter block is the tag with the most significant bit
 /// > of the last byte set to one.
-fn init_ctr<Aes>(cipher: Aes, nonce: &cipher::Block<Aes>) -> Ctr32LE<Aes>
+fn init_ctr<Aes>(cipher: &Aes, nonce: &cipher::Block<Aes>) -> Ctr32LE<Aes>
 where
-    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt,
-    Aes::ParBlocks: ArrayLength<Block<Aes>>,
+    Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     let mut counter_block = *nonce;
+    let core = CtrCore::<Aes, FlavorCtr32LE>::inner_iv_init(cipher.clone(), &counter_block);
     counter_block[15] |= 0x80;
-    Ctr32LE::from_block_cipher(cipher, &counter_block)
+    Ctr32LE::from_core(core)
 }
