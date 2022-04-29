@@ -133,7 +133,7 @@ use aead::{AeadCore, AeadInPlace, Error, NewAead};
 use cipher::{
     consts::{U0, U12, U16},
     generic_array::{typenum::Unsigned, GenericArray},
-    BlockCipher, BlockEncrypt, InnerIvInit, KeyInit, KeyIvInit, ParBlocksSizeUser, StreamCipher,
+    BlockCipher, BlockEncrypt, InnerIvInit, KeyInit, ParBlocksSizeUser, StreamCipher,
 };
 use ctr::{flavors::Ctr32LE as FlavorCtr32LE, Ctr32LE, CtrCore};
 use polyval::{
@@ -405,7 +405,7 @@ where
     Aes: BlockCipher<BlockSize = U16> + BlockEncrypt + Clone + KeyInit + ParBlocksSizeUser,
 {
     let mut counter_block = *nonce;
-    let core = CtrCore::<Aes, FlavorCtr32LE>::inner_iv_init(cipher.clone(), &counter_block);
     counter_block[15] |= 0x80;
+    let core = CtrCore::<Aes, FlavorCtr32LE>::inner_iv_init(cipher.clone(), &counter_block);
     Ctr32LE::from_core(core)
 }
