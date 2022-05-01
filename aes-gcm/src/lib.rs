@@ -1,108 +1,3 @@
-//! AES-GCM: [Authenticated Encryption and Associated Data (AEAD)][1] cipher
-//! based on AES in [Galois/Counter Mode][2].
-//!
-//! ## Performance Notes
-//!
-//! By default this crate will use software implementations of both AES and
-//! the POLYVAL universal hash function.
-//!
-//! When targeting modern x86/x86_64 CPUs, use the following `RUSTFLAGS` to
-//! take advantage of high performance AES-NI and CLMUL CPU intrinsics:
-//!
-//! ```text
-//! RUSTFLAGS="-Ctarget-cpu=sandybridge -Ctarget-feature=+aes,+sse2,+sse4.1,+ssse3"
-//! ```
-//!
-//! ## Security Notes
-//!
-//! This crate has received one [security audit by NCC Group][3], with no significant
-//! findings. We would like to thank [MobileCoin][4] for funding the audit.
-//!
-//! All implementations contained in the crate are designed to execute in constant
-//! time, either by relying on hardware intrinsics (i.e. AES-NI and CLMUL on
-//! x86/x86_64), or using a portable implementation which is only constant time
-//! on processors which implement constant-time multiplication.
-//!
-//! It is not suitable for use on processors with a variable-time multiplication
-//! operation (e.g. short circuit on multiply-by-zero / multiply-by-one, such as
-//! certain 32-bit PowerPC CPUs and some non-ARM microcontrollers).
-//!
-//! # Usage
-//!
-//! Simple usage (allocating, no associated data):
-//!
-//! ```
-//! use aes_gcm::{Aes256Gcm, Key, Nonce}; // Or `Aes128Gcm`
-//! use aes_gcm::aead::{Aead, NewAead};
-//!
-//! let key = Key::<Aes256Gcm>::from_slice(b"an example very very secret key.");
-//! let cipher = Aes256Gcm::new(key);
-//!
-//! let nonce = Nonce::from_slice(b"unique nonce"); // 96-bits; unique per message
-//!
-//! let ciphertext = cipher.encrypt(nonce, b"plaintext message".as_ref())
-//!     .expect("encryption failure!"); // NOTE: handle this error to avoid panics!
-//!
-//! let plaintext = cipher.decrypt(nonce, ciphertext.as_ref())
-//!     .expect("decryption failure!"); // NOTE: handle this error to avoid panics!
-//!
-//! assert_eq!(&plaintext, b"plaintext message");
-//! ```
-//!
-//! ## In-place Usage (eliminates `alloc` requirement)
-//!
-//! This crate has an optional `alloc` feature which can be disabled in e.g.
-//! microcontroller environments that don't have a heap.
-//!
-//! The [`AeadInPlace::encrypt_in_place`] and [`AeadInPlace::decrypt_in_place`]
-//! methods accept any type that impls the [`aead::Buffer`] trait which
-//! contains the plaintext for encryption or ciphertext for decryption.
-//!
-//! Note that if you enable the `heapless` feature of this crate,
-//! you will receive an impl of [`aead::Buffer`] for `heapless::Vec`
-//! (re-exported from the [`aead`] crate as [`aead::heapless::Vec`]),
-//! which can then be passed as the `buffer` parameter to the in-place encrypt
-//! and decrypt methods:
-//!
-#![cfg_attr(feature = "heapless", doc = " ```")]
-#![cfg_attr(not(feature = "heapless"), doc = " ```ignore")]
-//! use aes_gcm::{Aes256Gcm, Key, Nonce}; // Or `Aes128Gcm`
-//! use aes_gcm::aead::{AeadInPlace, NewAead};
-//! use aes_gcm::aead::heapless::Vec;
-//!
-//! let key = Key::<Aes256Gcm>::from_slice(b"an example very very secret key.");
-//! let cipher = Aes256Gcm::new(key);
-//!
-//! let nonce = Nonce::from_slice(b"unique nonce"); // 96-bits; unique per message
-//!
-//! let mut buffer: Vec<u8, 128> = Vec::new(); // Buffer needs 16-bytes overhead for GCM tag
-//! buffer.extend_from_slice(b"plaintext message");
-//!
-//! // Encrypt `buffer` in-place, replacing the plaintext contents with ciphertext
-//! cipher.encrypt_in_place(nonce, b"", &mut buffer).expect("encryption failure!");
-//!
-//! // `buffer` now contains the message ciphertext
-//! assert_ne!(&buffer, b"plaintext message");
-//!
-//! // Decrypt `buffer` in-place, replacing its ciphertext context with the original plaintext
-//! cipher.decrypt_in_place(nonce, b"", &mut buffer).expect("decryption failure!");
-//! assert_eq!(&buffer, b"plaintext message");
-//! ```
-//!
-//! [1]: https://en.wikipedia.org/wiki/Authenticated_encryption
-//! [2]: https://en.wikipedia.org/wiki/Galois/Counter_Mode
-//! [3]: https://research.nccgroup.com/2020/02/26/public-report-rustcrypto-aes-gcm-and-chacha20poly1305-implementation-review/
-//! [4]: https://www.mobilecoin.com/
-
-#![no_std]
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![doc(
-    html_logo_url = "https://raw.githubusercontent.com/RustCrypto/meta/master/logo.svg",
-    html_favicon_url = "https://raw.githubusercontent.com/RustCrypto/meta/master/logo.svg"
-)]
-#![deny(unsafe_code)]
-#![warn(missing_docs, rust_2018_idioms)]
-
 pub use aead::{self, AeadCore, AeadInPlace, Error, NewAead};
 pub use cipher::Key;
 
@@ -119,6 +14,7 @@ use ghash::{
     universal_hash::{NewUniversalHash, UniversalHash},
     GHash,
 };
+use subtle::Choice;
 
 #[cfg(feature = "zeroize")]
 use zeroize::Zeroize;
@@ -156,6 +52,58 @@ type Block = GenericArray<u8, U16>;
 
 /// Counter mode with a 32-bit big endian counter.
 type Ctr32BE<Aes> = ctr::CtrCore<Aes, ctr::flavors::Ctr32BE>;
+
+pub trait ClobberingDecrypt: AeadCore {
+    /// Decrypts a ciphertext. In events of success or authentication error, the input `buffer`
+    /// will be modified, or _clobbered_.
+    ///
+    /// On success, returns `Choice(1)`. On authentication error, returns `Choice(0)`. If an input
+    /// is malformed, returns `Err(Error)`.
+    fn clobbering_decrypt(
+        &self,
+        nonce: &aead::Nonce<Self>,
+        associated_data: &[u8],
+        buffer: &mut [u8],
+        tag: &aead::Tag<Self>,
+    ) -> Result<Choice, Error>;
+
+    /// Reverts the plaintext to its state before a decryption was attempted. This should only be
+    /// called when `clobbering_decrypt` had an authentication error.
+    fn unclobber(&self, nonce: &aead::Nonce<Self>, buffer: &mut [u8], tag: &aead::Tag<Self>);
+}
+
+impl<Aes, NonceSize> ClobberingDecrypt for AesGcm<Aes, NonceSize>
+where
+    Aes: BlockCipher + BlockSizeUser<BlockSize = U16> + BlockEncrypt,
+    NonceSize: ArrayLength<u8>,
+{
+    fn clobbering_decrypt(
+        &self,
+        nonce: &Nonce<NonceSize>,
+        associated_data: &[u8],
+        buffer: &mut [u8],
+        tag: &Tag,
+    ) -> Result<Choice, Error> {
+        if buffer.len() as u64 > C_MAX || associated_data.len() as u64 > A_MAX {
+            return Err(Error);
+        }
+
+        let (ctr, mask) = self.init_ctr(nonce);
+
+        // TODO(tarcieri): interleave encryption with GHASH
+        // See: <https://github.com/RustCrypto/AEADs/issues/74>
+        let expected_tag = self.compute_tag(mask, associated_data, buffer);
+        ctr.apply_keystream_partial(buffer.into());
+
+        use subtle::ConstantTimeEq;
+        Ok(expected_tag.ct_eq(tag))
+    }
+
+    fn unclobber(&self, nonce: &aead::Nonce<Self>, buffer: &mut [u8], _: &Tag) {
+        let (ctr, _) = self.init_ctr(nonce);
+        ctr.apply_keystream_partial(buffer.into());
+    }
+}
 
 /// AES-GCM: generic over an underlying AES implementation and nonce size.
 ///
@@ -260,21 +208,13 @@ where
         buffer: &mut [u8],
         tag: &Tag,
     ) -> Result<(), Error> {
-        if buffer.len() as u64 > C_MAX || associated_data.len() as u64 > A_MAX {
-            return Err(Error);
-        }
-
-        let (ctr, mask) = self.init_ctr(nonce);
-
-        // TODO(tarcieri): interleave encryption with GHASH
-        // See: <https://github.com/RustCrypto/AEADs/issues/74>
-        let expected_tag = self.compute_tag(mask, associated_data, buffer);
-        ctr.apply_keystream_partial(buffer.into());
-
-        use subtle::ConstantTimeEq;
-        if expected_tag.ct_eq(tag).unwrap_u8() == 1 {
+        // Call down to the clobbering impl
+        let res = self.clobbering_decrypt(nonce, associated_data, buffer, tag)?;
+        if res.unwrap_u8() == 1 {
             Ok(())
         } else {
+            // Unclobber so the caller doesn't see unauthenticated plaintext
+            self.unclobber(nonce, buffer, tag);
             Err(Error)
         }
     }
